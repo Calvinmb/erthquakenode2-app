@@ -7,24 +7,35 @@ import plotly.express as px
 from datetime import datetime
 
 # =========================
-# CONFIG A MODIFIER
+# CONFIG (STREAMLIT SECRETS)
 # =========================
-DATABASE_URL = "https://project-final-463aa-default-rtdb.europe-west1.firebasedatabase.app/"
-SERVICE_KEY  = "serviceAccountKey.json"
-
-# Chemins Firebase (adapte si besoin)
-PATH_LATEST  = "node2/latest"     # ex: node2/latest
-PATH_HISTORY = "node2/history"    # ex: node2/history (si tu l'as)
-PATH_CMD     = "node2/commands"   # ex: node2/commands
+PATH_LATEST  = "node2/latest"
+PATH_HISTORY = "node2/history"     # si tu l'as
+PATH_CMD     = "node2/commands"
 
 REFRESH_MS   = 2000  # 2s
 
 # =========================
 # INIT FIREBASE (1 fois)
 # =========================
-if not firebase_admin._apps:
-    cred = credentials.Certificate(SERVICE_KEY)
+def init_firebase():
+    if firebase_admin._apps:
+        return
+
+    # URL RTDB
+    DATABASE_URL = st.secrets["FIREBASE_DATABASE_URL"]
+
+    # Service account (depuis Secrets)
+    service_account = dict(st.secrets["firebase"])
+
+    # Corrige les \n si Streamlit les garde en texte
+    if "private_key" in service_account and isinstance(service_account["private_key"], str):
+        service_account["private_key"] = service_account["private_key"].replace("\\n", "\n")
+
+    cred = credentials.Certificate(service_account)
     firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+
+init_firebase()
 
 # =========================
 # PAGE CONFIG + CSS
@@ -36,7 +47,6 @@ CUSTOM_CSS = """
 :root{
   --bg:#0b1220;
   --card:#101a2f;
-  --card2:#0f172a;
   --text:#e5e7eb;
   --muted:#94a3b8;
   --accent:#60a5fa;
@@ -45,10 +55,8 @@ CUSTOM_CSS = """
   --bad:#ef4444;
   --violet:#a855f7;
 }
-
 .main { background: linear-gradient(135deg, #0b1220 0%, #0b1630 55%, #0b1220 100%); }
 .block-container { padding-top: 1.4rem; }
-
 h1,h2,h3 { color: var(--text) !important; }
 p,div,span,label { color: var(--text); }
 
@@ -108,10 +116,9 @@ def safe_int(x):
         return None
 
 def compute_status(t, lum, snd):
-    # Ajuste les seuils selon ton projet
     TEMP_HIGH  = 30.0
     LUM_NIGHT  = 1200
-    SOUND_HIGH = 2500  # si ton capteur sonore est 0..4095 (analogRead)
+    SOUND_HIGH = 2500
 
     if t is None or lum is None or snd is None:
         return "UNKNOWN", "unk"
@@ -124,31 +131,26 @@ def compute_status(t, lum, snd):
     return "OK", "ok"
 
 def get_latest():
-    ref = db.reference(PATH_LATEST)
-    data = ref.get() or {}
-    return data
+    return db.reference(PATH_LATEST).get() or {}
 
-def get_history_as_df(limit=60):
-    # Si tu n'as pas de history, on renvoie None
-    ref = db.reference(PATH_HISTORY)
-    hist = ref.get()
+def get_history_as_df(limit=80):
+    hist = db.reference(PATH_HISTORY).get()
     if not hist:
         return None
 
-    # hist peut être dict {pushId: {..}, pushId2: {..}}
     rows = []
-    for k, v in hist.items():
-        if isinstance(v, dict):
-            rows.append(v)
+    if isinstance(hist, dict):
+        for _, v in hist.items():
+            if isinstance(v, dict):
+                rows.append(v)
 
     if not rows:
         return None
 
     df = pd.DataFrame(rows)
 
-    # Normaliser colonne timestamp si présente
+    # timestamp -> dt
     if "timestamp" in df.columns:
-        # timestamp peut être epoch ou string
         def to_dt(val):
             try:
                 if isinstance(val, (int, float)):
@@ -160,8 +162,7 @@ def get_history_as_df(limit=60):
     else:
         df["dt"] = pd.NaT
 
-    # Colonnes attendues
-    for c in ["temperature","humidity","luminosity","sound"]:
+    for c in ["temperature", "humidity", "luminosity", "sound"]:
         if c not in df.columns:
             df[c] = None
 
@@ -174,30 +175,52 @@ def send_command(payload: dict):
 # =========================
 # HEADER
 # =========================
-colA, colB = st.columns([3,1])
+colA, colB = st.columns([3, 1])
 with colA:
     st.title("📡 Tableau de bord IoT — Node2")
-    st.caption("Données temps réel (Firebase RTDB) + commandes (LED RGB, mode nuit, force publish).")
+    st.caption("Données temps réel (Firebase RTDB) + commandes.")
 with colB:
-    st.markdown('<div class="card">🔄 Rafraîchissement auto: <b>2s</b><br/><span style="color:#94a3b8">Localhost</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="card">🔄 Rafraîchissement auto: <b>{REFRESH_MS/1000:.0f}s</b><br/>'
+        f'<span style="color:#94a3b8">Streamlit Cloud</span></div>',
+        unsafe_allow_html=True
+    )
+
+# =========================
+# SIDEBAR (COMMANDES)
+# =========================
+st.sidebar.title("🎛️ Commandes")
+color = st.sidebar.selectbox("Couleur LED", ["off", "red", "green", "blue", "white", "yellow", "purple", "cyan"])
+night = st.sidebar.toggle("Mode nuit")
+
+if st.sidebar.button("📤 Envoyer commande LED"):
+    send_command({"led": color})
+    st.sidebar.success(f"Commande LED envoyée: {color}")
+
+if st.sidebar.button("🌙 Appliquer mode nuit"):
+    send_command({"night_mode": bool(night)})
+    st.sidebar.success(f"Mode nuit: {night}")
+
+if st.sidebar.button("⚡ Force envoi données"):
+    send_command({"force_publish": True})
+    st.sidebar.success("Force publish demandé")
 
 # =========================
 # LOAD DATA
 # =========================
 latest = get_latest()
-
 temp = safe_float(latest.get("temperature"))
 hum  = safe_float(latest.get("humidity"))
 ldr  = safe_int(latest.get("luminosity"))
 son  = safe_int(latest.get("sound"))
-ts   = latest.get("timestamp", None)
+ts   = latest.get("timestamp")
 
 status_txt, status_cls = compute_status(temp, ldr, son)
 
 # =========================
 # KPI ROW
 # =========================
-k1, k2, k3, k4, k5 = st.columns([1.2,1.2,1.2,1.2,1.2])
+k1, k2, k3, k4, k5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2])
 
 def kpi_card(title, value, suffix="", sub=""):
     val = "—" if value is None else f"{value}{suffix}"
@@ -213,9 +236,9 @@ def kpi_card(title, value, suffix="", sub=""):
     )
 
 with k1:
-    kpi_card("Température", None if temp is None else round(temp,1), " °C", "Capteur DHT11")
+    kpi_card("Température", None if temp is None else round(temp, 1), " °C", "Capteur DHT11")
 with k2:
-    kpi_card("Humidité", None if hum is None else round(hum,1), " %", "Capteur DHT11")
+    kpi_card("Humidité", None if hum is None else round(hum, 1), " %", "Capteur DHT11")
 with k3:
     kpi_card("Luminosité", ldr, "", "LDR (0–4095)")
 with k4:
@@ -224,12 +247,47 @@ with k5:
     badge_html = f'<span class="badge {status_cls}">STATUT: {status_txt}</span>'
     ts_txt = "Aucun" if not ts else str(ts)
     st.markdown(
-    f"""
-    <div class="card">
-      <div class="kpi-title">État</div>
-      <div style="margin-bottom:10px;">{badge_html}</div>
-      <div class="kpi-sub">Horodatage : {ts_txt}</div>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+        f"""
+        <div class="card">
+          <div class="kpi-title">État</div>
+          <div style="margin-bottom:10px;">{badge_html}</div>
+          <div class="kpi-sub">Horodatage : {ts_txt}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+# =========================
+# GRAPHIQUES (HISTORY)
+# =========================
+st.subheader("📈 Historique (si disponible)")
+df = get_history_as_df(limit=80)
+
+if df is None or df.empty:
+    st.info("Aucun historique trouvé dans Firebase (node2/history). Tu peux garder uniquement latest, ou activer l’historique côté Node-RED.")
+else:
+    # Conserver uniquement les lignes valides
+    df_plot = df.copy()
+    if "dt" in df_plot.columns:
+        df_plot = df_plot.dropna(subset=["dt"])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig1 = px.line(df_plot, x="dt", y="temperature", title="Température (°C)")
+        st.plotly_chart(fig1, use_container_width=True)
+    with c2:
+        fig2 = px.line(df_plot, x="dt", y="humidity", title="Humidité (%)")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        fig3 = px.line(df_plot, x="dt", y="luminosity", title="Luminosité (LDR)")
+        st.plotly_chart(fig3, use_container_width=True)
+    with c4:
+        fig4 = px.line(df_plot, x="dt", y="sound", title="Son (KY-038)")
+        st.plotly_chart(fig4, use_container_width=True)
+
+    st.markdown("<div class='card'><div class='kpi-title'>Dernières lignes</div></div>", unsafe_allow_html=True)
+    st.dataframe(df.tail(15), use_container_width=True)
