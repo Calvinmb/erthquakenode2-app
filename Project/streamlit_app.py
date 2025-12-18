@@ -5,37 +5,31 @@ from firebase_admin import credentials, db
 import pandas as pd
 import plotly.express as px
 from datetime import datetime
+import requests
 
 # =========================
-# CONFIG (STREAMLIT SECRETS)
+# CONFIG A MODIFIER
 # =========================
+DATABASE_URL = "https://project-final-463aa-default-rtdb.europe-west1.firebasedatabase.app/"
+SERVICE_KEY  = "serviceAccountKey.json"
+
+# 🔥 URL Node-RED (HTTP -> MQTT)
+# Exemple: "http://20.xx.xx.xx:1880/api/node2/cmd"
+NODE_RED_URL = "http://172.161.163.190:1883/api/node2/cmd"   # <-- CHANGE ICI
+
+# Chemins Firebase (adapte si besoin)
 PATH_LATEST  = "node2/latest"
-PATH_HISTORY = "node2/history"     # si tu l'as
-PATH_CMD     = "node2/commands"
+PATH_HISTORY = "node2/history"
+PATH_CMD     = "node2/commands"   # (plus utilisé pour commander, mais tu peux le garder)
 
 REFRESH_MS   = 2000  # 2s
 
 # =========================
 # INIT FIREBASE (1 fois)
 # =========================
-def init_firebase():
-    if firebase_admin._apps:
-        return
-
-    # URL RTDB
-    DATABASE_URL = st.secrets["FIREBASE_DATABASE_URL"]
-
-    # Service account (depuis Secrets)
-    service_account = dict(st.secrets["firebase"])
-
-    # Corrige les \n si Streamlit les garde en texte
-    if "private_key" in service_account and isinstance(service_account["private_key"], str):
-        service_account["private_key"] = service_account["private_key"].replace("\\n", "\n")
-
-    cred = credentials.Certificate(service_account)
+if not firebase_admin._apps:
+    cred = credentials.Certificate(SERVICE_KEY)
     firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
-
-init_firebase()
 
 # =========================
 # PAGE CONFIG + CSS
@@ -47,6 +41,7 @@ CUSTOM_CSS = """
 :root{
   --bg:#0b1220;
   --card:#101a2f;
+  --card2:#0f172a;
   --text:#e5e7eb;
   --muted:#94a3b8;
   --accent:#60a5fa;
@@ -55,8 +50,10 @@ CUSTOM_CSS = """
   --bad:#ef4444;
   --violet:#a855f7;
 }
+
 .main { background: linear-gradient(135deg, #0b1220 0%, #0b1630 55%, #0b1220 100%); }
 .block-container { padding-top: 1.4rem; }
+
 h1,h2,h3 { color: var(--text) !important; }
 p,div,span,label { color: var(--text); }
 
@@ -131,25 +128,25 @@ def compute_status(t, lum, snd):
     return "OK", "ok"
 
 def get_latest():
-    return db.reference(PATH_LATEST).get() or {}
+    ref = db.reference(PATH_LATEST)
+    data = ref.get() or {}
+    return data
 
-def get_history_as_df(limit=80):
-    hist = db.reference(PATH_HISTORY).get()
+def get_history_as_df(limit=60):
+    ref = db.reference(PATH_HISTORY)
+    hist = ref.get()
     if not hist:
         return None
 
     rows = []
-    if isinstance(hist, dict):
-        for _, v in hist.items():
-            if isinstance(v, dict):
-                rows.append(v)
-
+    for _, v in hist.items():
+        if isinstance(v, dict):
+            rows.append(v)
     if not rows:
         return None
 
     df = pd.DataFrame(rows)
 
-    # timestamp -> dt
     if "timestamp" in df.columns:
         def to_dt(val):
             try:
@@ -159,68 +156,110 @@ def get_history_as_df(limit=80):
             except:
                 return pd.NaT
         df["dt"] = df["timestamp"].apply(to_dt)
+    elif "ts" in df.columns:
+        # si tu utilises ts en ms (comme dans ton ESP32 JSON)
+        def to_dt_ms(val):
+            try:
+                return datetime.fromtimestamp(float(val)/1000.0)
+            except:
+                return pd.NaT
+        df["dt"] = df["ts"].apply(to_dt_ms)
     else:
         df["dt"] = pd.NaT
 
-    for c in ["temperature", "humidity", "luminosity", "sound"]:
+    for c in ["temperature","humidity","luminosity","sound"]:
         if c not in df.columns:
             df[c] = None
 
     df = df.sort_values("dt", na_position="last").tail(limit)
     return df
 
+# ✅ Commande via Node-RED HTTP -> MQTT
 def send_command(payload: dict):
-    db.reference(PATH_CMD).update(payload)
+    try:
+        r = requests.post(NODE_RED_URL, json=payload, timeout=5)
+        return r.status_code, r.text
+    except Exception as e:
+        return None, str(e)
+
+# =========================
+# SIDEBAR COMMANDES
+# =========================
+st.sidebar.title("🎛️ Commandes (MQTT via Node-RED)")
+
+hex_color = st.sidebar.color_picker("Couleur LED RGB", "#ff0000")
+r = int(hex_color[1:3], 16)
+g = int(hex_color[3:5], 16)
+b = int(hex_color[5:7], 16)
+
+mode_nuit = st.sidebar.toggle("Mode nuit", value=False)
+
+c1, c2 = st.sidebar.columns(2)
+
+with c1:
+    if st.button("Envoyer couleur"):
+        code, txt = send_command({"rgb": {"r": r, "g": g, "b": b}})
+        if code == 200:
+            st.sidebar.success(f"Couleur envoyée ✅ ({r},{g},{b})")
+        else:
+            st.sidebar.error(f"Erreur: {code} / {txt}")
+
+with c2:
+    if st.button("OFF"):
+        code, txt = send_command({"rgb": {"r": 0, "g": 0, "b": 0}})
+        if code == 200:
+            st.sidebar.success("LED OFF ✅")
+        else:
+            st.sidebar.error(f"Erreur: {code} / {txt}")
+
+if st.sidebar.button("Appliquer mode nuit"):
+    code, txt = send_command({"night": 1 if mode_nuit else 0})
+    if code == 200:
+        st.sidebar.success("Mode nuit envoyé ✅")
+    else:
+        st.sidebar.error(f"Erreur: {code} / {txt}")
+
+if st.sidebar.button("⚡ Force envoi données"):
+    code, txt = send_command({"forceSend": 1})
+    if code == 200:
+        st.sidebar.success("ForceSend envoyé ✅")
+    else:
+        st.sidebar.error(f"Erreur: {code} / {txt}")
+
+st.sidebar.markdown("---")
+st.sidebar.caption("Endpoint Node-RED attendu : POST /api/node2/cmd")
 
 # =========================
 # HEADER
 # =========================
-colA, colB = st.columns([3, 1])
+colA, colB = st.columns([3,1])
 with colA:
     st.title("📡 Tableau de bord IoT — Node2")
-    st.caption("Données temps réel (Firebase RTDB) + commandes.")
+    st.caption("Données temps réel (Firebase RTDB) + commandes LED RGB / mode nuit / force publish.")
 with colB:
     st.markdown(
-        f'<div class="card">🔄 Rafraîchissement auto: <b>{REFRESH_MS/1000:.0f}s</b><br/>'
-        f'<span style="color:#94a3b8">Streamlit Cloud</span></div>',
+        f'<div class="card">🔄 Rafraîchissement auto: <b>{int(REFRESH_MS/1000)}s</b><br/>'
+        f'<span style="color:#94a3b8">Firebase RTDB</span></div>',
         unsafe_allow_html=True
     )
-
-# =========================
-# SIDEBAR (COMMANDES)
-# =========================
-st.sidebar.title("🎛️ Commandes")
-color = st.sidebar.selectbox("Couleur LED", ["off", "red", "green", "blue", "white", "yellow", "purple", "cyan"])
-night = st.sidebar.toggle("Mode nuit")
-
-if st.sidebar.button("📤 Envoyer commande LED"):
-    send_command({"led": color})
-    st.sidebar.success(f"Commande LED envoyée: {color}")
-
-if st.sidebar.button("🌙 Appliquer mode nuit"):
-    send_command({"night_mode": bool(night)})
-    st.sidebar.success(f"Mode nuit: {night}")
-
-if st.sidebar.button("⚡ Force envoi données"):
-    send_command({"force_publish": True})
-    st.sidebar.success("Force publish demandé")
 
 # =========================
 # LOAD DATA
 # =========================
 latest = get_latest()
+
 temp = safe_float(latest.get("temperature"))
 hum  = safe_float(latest.get("humidity"))
 ldr  = safe_int(latest.get("luminosity"))
 son  = safe_int(latest.get("sound"))
-ts   = latest.get("timestamp")
+ts   = latest.get("timestamp", latest.get("ts", None))
 
 status_txt, status_cls = compute_status(temp, ldr, son)
 
 # =========================
 # KPI ROW
 # =========================
-k1, k2, k3, k4, k5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2])
+k1, k2, k3, k4, k5 = st.columns([1.2,1.2,1.2,1.2,1.2])
 
 def kpi_card(title, value, suffix="", sub=""):
     val = "—" if value is None else f"{value}{suffix}"
@@ -236,9 +275,9 @@ def kpi_card(title, value, suffix="", sub=""):
     )
 
 with k1:
-    kpi_card("Température", None if temp is None else round(temp, 1), " °C", "Capteur DHT11")
+    kpi_card("Température", None if temp is None else round(temp,1), " °C", "Capteur DHT11")
 with k2:
-    kpi_card("Humidité", None if hum is None else round(hum, 1), " %", "Capteur DHT11")
+    kpi_card("Humidité", None if hum is None else round(hum,1), " %", "Capteur DHT11")
 with k3:
     kpi_card("Luminosité", ldr, "", "LDR (0–4095)")
 with k4:
@@ -247,47 +286,44 @@ with k5:
     badge_html = f'<span class="badge {status_cls}">STATUT: {status_txt}</span>'
     ts_txt = "Aucun" if not ts else str(ts)
     st.markdown(
-        f"""
-        <div class="card">
-          <div class="kpi-title">État</div>
-          <div style="margin-bottom:10px;">{badge_html}</div>
-          <div class="kpi-sub">Horodatage : {ts_txt}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    f"""
+    <div class="card">
+      <div class="kpi-title">État</div>
+      <div style="margin-bottom:10px;">{badge_html}</div>
+      <div class="kpi-sub">Horodatage : {ts_txt}</div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
+# =========================
+# HISTORIQUE (si disponible)
+# =========================
 st.markdown("<hr/>", unsafe_allow_html=True)
-
-# =========================
-# GRAPHIQUES (HISTORY)
-# =========================
 st.subheader("📈 Historique (si disponible)")
-df = get_history_as_df(limit=80)
 
+df = get_history_as_df(limit=120)
 if df is None or df.empty:
-    st.info("Aucun historique trouvé dans Firebase (node2/history). Tu peux garder uniquement latest, ou activer l’historique côté Node-RED.")
+    st.info("Aucun historique trouvé dans Firebase (node2/history). Tu peux garder uniquement latest, ou activer l'historique côté Node-RED.")
 else:
-    # Conserver uniquement les lignes valides
-    df_plot = df.copy()
-    if "dt" in df_plot.columns:
-        df_plot = df_plot.dropna(subset=["dt"])
+    # Choix colonne pour graph
+    colx = "dt" if "dt" in df.columns else df.index
 
     c1, c2 = st.columns(2)
     with c1:
-        fig1 = px.line(df_plot, x="dt", y="temperature", title="Température (°C)")
-        st.plotly_chart(fig1, use_container_width=True)
+        fig = px.line(df, x="dt", y="temperature", title="Température")
+        st.plotly_chart(fig, use_container_width=True)
     with c2:
-        fig2 = px.line(df_plot, x="dt", y="humidity", title="Humidité (%)")
-        st.plotly_chart(fig2, use_container_width=True)
+        fig = px.line(df, x="dt", y="humidity", title="Humidité")
+        st.plotly_chart(fig, use_container_width=True)
 
     c3, c4 = st.columns(2)
     with c3:
-        fig3 = px.line(df_plot, x="dt", y="luminosity", title="Luminosité (LDR)")
-        st.plotly_chart(fig3, use_container_width=True)
+        fig = px.line(df, x="dt", y="luminosity", title="Luminosité")
+        st.plotly_chart(fig, use_container_width=True)
     with c4:
-        fig4 = px.line(df_plot, x="dt", y="sound", title="Son (KY-038)")
-        st.plotly_chart(fig4, use_container_width=True)
+        fig = px.line(df, x="dt", y="sound", title="Son")
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("<div class='card'><div class='kpi-title'>Dernières lignes</div></div>", unsafe_allow_html=True)
-    st.dataframe(df.tail(15), use_container_width=True)
+    with st.expander("Voir les données"):
+        st.dataframe(df)
