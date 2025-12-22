@@ -1,6 +1,0 @@
-streamlit
-streamlit-autorefresh
-firebase-admin
-pandas
-plotly
-requests
