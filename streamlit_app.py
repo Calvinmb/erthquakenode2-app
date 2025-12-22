@@ -19,7 +19,7 @@ DATABASE_URL = st.secrets["DATABASE_URL"]
 
 # 🔥 URL Node-RED (HTTP endpoint)
 # ⚠️ 1880 = Node-RED HTTP (1883 = MQTT)
-NODE_RED_URL = st.secrets.get("NODE_RED_URL", "http://172.161.163.190:1883/api/node2/cmd")
+NODE_RED_URL = st.secrets.get("NODE_RED_URL", "http://172.161.163.190:1880/api/node2/cmd")
 
 # Chemins Firebase
 PATH_LATEST  = "node2/latest"
