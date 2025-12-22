@@ -8,27 +8,36 @@ from datetime import datetime
 import requests
 
 # =========================
-# CONFIG A MODIFIER
+# CONFIG (via Streamlit Secrets)
 # =========================
-DATABASE_URL = "https://project-final-463aa-default-rtdb.europe-west1.firebasedatabase.app/"
-SERVICE_KEY  = "serviceAccountKey.json"
+# Dans Streamlit Cloud -> Settings -> Secrets :
+# DATABASE_URL = "https://....firebasedatabase.app/"
+# [firebase]
+# type="service_account"
+# ...
+DATABASE_URL = st.secrets["https://project-final-463aa-default-rtdb.europe-west1.firebasedatabase.app/"]
 
-# 🔥 URL Node-RED (HTTP -> MQTT)
-# Exemple: "http://20.xx.xx.xx:1880/api/node2/cmd"
-NODE_RED_URL = "http://172.161.163.190:1883/api/node2/cmd"   # <-- CHANGE ICI
+# 🔥 URL Node-RED (HTTP endpoint)
+# ⚠️ 1880 = Node-RED HTTP (1883 = MQTT)
+NODE_RED_URL = st.secrets.get("NODE_RED_URL", "http://172.161.163.190:1883/api/node2/cmd")
 
-# Chemins Firebase (adapte si besoin)
+# Chemins Firebase
 PATH_LATEST  = "node2/latest"
 PATH_HISTORY = "node2/history"
-PATH_CMD     = "node2/commands"   # (plus utilisé pour commander, mais tu peux le garder)
+PATH_CMD     = "node2/commands"   # optionnel
 
 REFRESH_MS   = 2000  # 2s
 
 # =========================
 # INIT FIREBASE (1 fois)
 # =========================
+service_account_info = dict(st.secrets["firebase"])
+# au cas où la clé privée arrive avec \n échappés
+if "private_key" in service_account_info and isinstance(service_account_info["private_key"], str):
+    service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
+
 if not firebase_admin._apps:
-    cred = credentials.Certificate(SERVICE_KEY)
+    cred = credentials.Certificate(service_account_info)  # ✅ dict, pas un fichier
     firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
 
 # =========================
@@ -103,13 +112,13 @@ st_autorefresh(interval=REFRESH_MS, key="refresh")
 def safe_float(x):
     try:
         return float(x)
-    except:
+    except Exception:
         return None
 
 def safe_int(x):
     try:
         return int(x)
-    except:
+    except Exception:
         return None
 
 def compute_status(t, lum, snd):
@@ -129,10 +138,9 @@ def compute_status(t, lum, snd):
 
 def get_latest():
     ref = db.reference(PATH_LATEST)
-    data = ref.get() or {}
-    return data
+    return ref.get() or {}
 
-def get_history_as_df(limit=60):
+def get_history_as_df(limit=120):
     ref = db.reference(PATH_HISTORY)
     hist = ref.get()
     if not hist:
@@ -142,32 +150,36 @@ def get_history_as_df(limit=60):
     for _, v in hist.items():
         if isinstance(v, dict):
             rows.append(v)
+
     if not rows:
         return None
 
     df = pd.DataFrame(rows)
 
+    # Gestion timestamp
     if "timestamp" in df.columns:
         def to_dt(val):
             try:
                 if isinstance(val, (int, float)):
                     return datetime.fromtimestamp(val)
                 return pd.to_datetime(val)
-            except:
+            except Exception:
                 return pd.NaT
         df["dt"] = df["timestamp"].apply(to_dt)
+
     elif "ts" in df.columns:
-        # si tu utilises ts en ms (comme dans ton ESP32 JSON)
         def to_dt_ms(val):
             try:
-                return datetime.fromtimestamp(float(val)/1000.0)
-            except:
+                return datetime.fromtimestamp(float(val) / 1000.0)
+            except Exception:
                 return pd.NaT
         df["dt"] = df["ts"].apply(to_dt_ms)
+
     else:
         df["dt"] = pd.NaT
 
-    for c in ["temperature","humidity","luminosity","sound"]:
+    # Colonnes attendues
+    for c in ["temperature", "humidity", "luminosity", "sound"]:
         if c not in df.columns:
             df[c] = None
 
@@ -197,7 +209,7 @@ mode_nuit = st.sidebar.toggle("Mode nuit", value=False)
 c1, c2 = st.sidebar.columns(2)
 
 with c1:
-    if st.button("Envoyer couleur"):
+    if st.sidebar.button("Envoyer couleur"):
         code, txt = send_command({"rgb": {"r": r, "g": g, "b": b}})
         if code == 200:
             st.sidebar.success(f"Couleur envoyée ✅ ({r},{g},{b})")
@@ -205,7 +217,7 @@ with c1:
             st.sidebar.error(f"Erreur: {code} / {txt}")
 
 with c2:
-    if st.button("OFF"):
+    if st.sidebar.button("OFF"):
         code, txt = send_command({"rgb": {"r": 0, "g": 0, "b": 0}})
         if code == 200:
             st.sidebar.success("LED OFF ✅")
@@ -232,7 +244,7 @@ st.sidebar.caption("Endpoint Node-RED attendu : POST /api/node2/cmd")
 # =========================
 # HEADER
 # =========================
-colA, colB = st.columns([3,1])
+colA, colB = st.columns([3, 1])
 with colA:
     st.title("📡 Tableau de bord IoT — Node2")
     st.caption("Données temps réel (Firebase RTDB) + commandes LED RGB / mode nuit / force publish.")
@@ -259,7 +271,7 @@ status_txt, status_cls = compute_status(temp, ldr, son)
 # =========================
 # KPI ROW
 # =========================
-k1, k2, k3, k4, k5 = st.columns([1.2,1.2,1.2,1.2,1.2])
+k1, k2, k3, k4, k5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2])
 
 def kpi_card(title, value, suffix="", sub=""):
     val = "—" if value is None else f"{value}{suffix}"
@@ -275,9 +287,9 @@ def kpi_card(title, value, suffix="", sub=""):
     )
 
 with k1:
-    kpi_card("Température", None if temp is None else round(temp,1), " °C", "Capteur DHT11")
+    kpi_card("Température", None if temp is None else round(temp, 1), " °C", "Capteur DHT11")
 with k2:
-    kpi_card("Humidité", None if hum is None else round(hum,1), " %", "Capteur DHT11")
+    kpi_card("Humidité", None if hum is None else round(hum, 1), " %", "Capteur DHT11")
 with k3:
     kpi_card("Luminosité", ldr, "", "LDR (0–4095)")
 with k4:
@@ -286,18 +298,18 @@ with k5:
     badge_html = f'<span class="badge {status_cls}">STATUT: {status_txt}</span>'
     ts_txt = "Aucun" if not ts else str(ts)
     st.markdown(
-    f"""
-    <div class="card">
-      <div class="kpi-title">État</div>
-      <div style="margin-bottom:10px;">{badge_html}</div>
-      <div class="kpi-sub">Horodatage : {ts_txt}</div>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+        f"""
+        <div class="card">
+          <div class="kpi-title">État</div>
+          <div style="margin-bottom:10px;">{badge_html}</div>
+          <div class="kpi-sub">Horodatage : {ts_txt}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 # =========================
-# HISTORIQUE (si disponible)
+# HISTORIQUE
 # =========================
 st.markdown("<hr/>", unsafe_allow_html=True)
 st.subheader("📈 Historique (si disponible)")
@@ -306,9 +318,6 @@ df = get_history_as_df(limit=120)
 if df is None or df.empty:
     st.info("Aucun historique trouvé dans Firebase (node2/history). Tu peux garder uniquement latest, ou activer l'historique côté Node-RED.")
 else:
-    # Choix colonne pour graph
-    colx = "dt" if "dt" in df.columns else df.index
-
     c1, c2 = st.columns(2)
     with c1:
         fig = px.line(df, x="dt", y="temperature", title="Température")
